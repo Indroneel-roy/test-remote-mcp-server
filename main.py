@@ -1,24 +1,33 @@
 from fastmcp import FastMCP
 import os
 import aiosqlite
-import tempfile
 import sqlite3
 import json
+import tempfile
 
 # ============================================================
-# Paths (PROJECT-LOCAL DATABASE — IMPORTANT FIX)
+# ENVIRONMENT-SAFE PATHS
 # ============================================================
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "expenses.db")
-CATEGORIES_PATH = os.path.join(BASE_DIR, "categories.json")
+IS_CLOUD = os.getenv("FASTMCP_CLOUD", "") or os.getenv("MCP_CLOUD", "")
+
+if IS_CLOUD:
+    # FastMCP Cloud → only /tmp is writable
+    DB_DIR = tempfile.gettempdir()
+else:
+    # Local dev → project directory
+    DB_DIR = os.path.dirname(os.path.abspath(__file__))
+
+DB_PATH = os.path.join(DB_DIR, "expenses.db")
+CATEGORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
 
 print(f"📂 Database path: {DB_PATH}")
+print(f"☁️ Running in cloud: {bool(IS_CLOUD)}")
 
 mcp = FastMCP("ExpenseTracker")
 
 # ============================================================
-# Database Initialization (SYNC — runs once)
+# DATABASE INIT (SYNC)
 # ============================================================
 
 def init_db():
@@ -35,23 +44,14 @@ def init_db():
                     note TEXT DEFAULT ''
                 )
             """)
-
-            # Write test (verifies permissions)
-            conn.execute(
-                "INSERT OR IGNORE INTO expenses(date, amount, category) VALUES (?, ?, ?)",
-                ("2000-01-01", 0, "test")
-            )
-            conn.execute("DELETE FROM expenses WHERE category = 'test'")
             conn.commit()
 
-        print("✅ Database initialized successfully")
+        print("✅ Database initialized")
 
     except Exception as e:
-        print(f"❌ Database initialization failed: {e}")
+        print(f"❌ DB init failed: {e}")
         raise
 
-
-# Run initialization at import time
 init_db()
 
 # ============================================================
@@ -60,9 +60,7 @@ init_db()
 
 @mcp.tool()
 async def add_expense(date, amount, category, subcategory="", note=""):
-    """
-    Add a new expense entry to the database.
-    """
+    """Add a new expense."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
@@ -76,22 +74,16 @@ async def add_expense(date, amount, category, subcategory="", note=""):
 
             return {
                 "status": "success",
-                "id": cur.lastrowid,
-                "message": "Expense added successfully"
+                "id": cur.lastrowid
             }
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Database error: {str(e)}"
-        }
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 async def list_expenses(start_date, end_date):
-    """
-    List expenses between two dates (inclusive).
-    """
+    """List expenses in date range."""
     try:
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
@@ -99,31 +91,24 @@ async def list_expenses(start_date, end_date):
                 SELECT id, date, amount, category, subcategory, note
                 FROM expenses
                 WHERE date BETWEEN ? AND ?
-                ORDER BY date DESC, id DESC
+                ORDER BY date DESC
                 """,
                 (start_date, end_date)
             )
-
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-
-            return [dict(zip(cols, row)) for row in rows]
+            return [dict(zip(cols, r)) for r in rows]
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error listing expenses: {str(e)}"
-        }
+        return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
 async def summarize(start_date, end_date, category=None):
-    """
-    Summarize expenses by category.
-    """
+    """Summarize expenses."""
     try:
         query = """
-            SELECT category, SUM(amount) AS total_amount, COUNT(*) AS count
+            SELECT category, SUM(amount) AS total, COUNT(*) AS count
             FROM expenses
             WHERE date BETWEEN ? AND ?
         """
@@ -133,20 +118,16 @@ async def summarize(start_date, end_date, category=None):
             query += " AND category = ?"
             params.append(category)
 
-        query += " GROUP BY category ORDER BY total_amount DESC"
+        query += " GROUP BY category ORDER BY total DESC"
 
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(query, params)
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-
-            return [dict(zip(cols, row)) for row in rows]
+            return [dict(zip(cols, r)) for r in rows]
 
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error summarizing expenses: {str(e)}"
-        }
+        return {"status": "error", "message": str(e)}
 
 # ============================================================
 # MCP RESOURCE
@@ -154,10 +135,7 @@ async def summarize(start_date, end_date, category=None):
 
 @mcp.resource("expense:///categories", mime_type="application/json")
 def categories():
-    """
-    Return expense categories.
-    """
-    default_categories = {
+    default = {
         "categories": [
             "Food & Dining",
             "Transportation",
@@ -176,18 +154,14 @@ def categories():
         if os.path.exists(CATEGORIES_PATH):
             with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
                 return f.read()
-        return json.dumps(default_categories, indent=2)
+        return json.dumps(default, indent=2)
 
     except Exception as e:
         return json.dumps({"error": str(e)})
 
 # ============================================================
-# Server start
+# SERVER
 # ============================================================
 
 if __name__ == "__main__":
-    mcp.run(
-        transport="http",
-        host="0.0.0.0",
-        port=8000
-    )
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
