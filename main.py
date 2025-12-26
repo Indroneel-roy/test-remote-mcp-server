@@ -1,7 +1,6 @@
 from fastmcp import FastMCP
 import os
 import aiosqlite
-import sqlite3
 import json
 import tempfile
 
@@ -12,29 +11,52 @@ import tempfile
 IS_CLOUD = os.getenv("FASTMCP_CLOUD", "") or os.getenv("MCP_CLOUD", "")
 
 if IS_CLOUD:
-    # FastMCP Cloud → only /tmp is writable
     DB_DIR = tempfile.gettempdir()
 else:
-    # Local dev → project directory
     DB_DIR = os.path.dirname(os.path.abspath(__file__))
 
 DB_PATH = os.path.join(DB_DIR, "expenses.db")
-CATEGORIES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "categories.json")
-
-print(f"📂 Database path: {DB_PATH}")
-print(f"☁️ Running in cloud: {bool(IS_CLOUD)}")
 
 mcp = FastMCP("ExpenseTracker")
 
 # ============================================================
-# DATABASE INIT (SYNC)
+# DEFAULT CATEGORIES (in-memory, no file dependency)
 # ============================================================
 
-def init_db():
+DEFAULT_CATEGORIES = {
+    "categories": [
+        "Food & Dining",
+        "Transportation",
+        "Shopping",
+        "Entertainment",
+        "Bills & Utilities",
+        "Healthcare",
+        "Travel",
+        "Education",
+        "Business",
+        "Other"
+    ]
+}
+
+# ============================================================
+# DATABASE INIT (ASYNC - lazy initialization)
+# ============================================================
+
+_db_initialized = False
+
+async def ensure_db():
+    """Lazy async database initialization."""
+    global _db_initialized
+    if _db_initialized:
+        return
+    
     try:
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("""
+        async with aiosqlite.connect(DB_PATH) as db:
+            # Don't use WAL in cloud/tmp - it can cause issues
+            if not IS_CLOUD:
+                await db.execute("PRAGMA journal_mode=WAL;")
+            
+            await db.execute("""
                 CREATE TABLE IF NOT EXISTS expenses (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     date TEXT NOT NULL,
@@ -44,24 +66,31 @@ def init_db():
                     note TEXT DEFAULT ''
                 )
             """)
-            conn.commit()
-
-        print("✅ Database initialized")
-
+            await db.commit()
+        
+        _db_initialized = True
+        
     except Exception as e:
-        print(f"❌ DB init failed: {e}")
-        raise
-
-init_db()
+        raise RuntimeError(f"Database initialization failed: {e}")
 
 # ============================================================
 # MCP TOOLS
 # ============================================================
 
 @mcp.tool()
-async def add_expense(date, amount, category, subcategory="", note=""):
-    """Add a new expense."""
+async def add_expense(date: str, amount: float, category: str, subcategory: str = "", note: str = ""):
+    """Add a new expense.
+    
+    Args:
+        date: Date in YYYY-MM-DD format
+        amount: Expense amount
+        category: Expense category
+        subcategory: Optional subcategory
+        note: Optional note
+    """
     try:
+        await ensure_db()
+        
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 """
@@ -74,7 +103,8 @@ async def add_expense(date, amount, category, subcategory="", note=""):
 
             return {
                 "status": "success",
-                "id": cur.lastrowid
+                "id": cur.lastrowid,
+                "message": f"Expense added: ${amount} for {category}"
             }
 
     except Exception as e:
@@ -82,9 +112,16 @@ async def add_expense(date, amount, category, subcategory="", note=""):
 
 
 @mcp.tool()
-async def list_expenses(start_date, end_date):
-    """List expenses in date range."""
+async def list_expenses(start_date: str, end_date: str):
+    """List expenses in date range.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+    """
     try:
+        await ensure_db()
+        
         async with aiosqlite.connect(DB_PATH) as db:
             cur = await db.execute(
                 """
@@ -97,16 +134,30 @@ async def list_expenses(start_date, end_date):
             )
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in rows]
+            expenses = [dict(zip(cols, r)) for r in rows]
+            
+            return {
+                "status": "success",
+                "count": len(expenses),
+                "expenses": expenses
+            }
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
 
 @mcp.tool()
-async def summarize(start_date, end_date, category=None):
-    """Summarize expenses."""
+async def summarize_expenses(start_date: str, end_date: str, category: str = None):
+    """Summarize expenses by category.
+    
+    Args:
+        start_date: Start date in YYYY-MM-DD format
+        end_date: End date in YYYY-MM-DD format
+        category: Optional category filter
+    """
     try:
+        await ensure_db()
+        
         query = """
             SELECT category, SUM(amount) AS total, COUNT(*) AS count
             FROM expenses
@@ -124,7 +175,42 @@ async def summarize(start_date, end_date, category=None):
             cur = await db.execute(query, params)
             rows = await cur.fetchall()
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in rows]
+            summary = [dict(zip(cols, r)) for r in rows]
+            
+            total = sum(row['total'] for row in summary)
+            
+            return {
+                "status": "success",
+                "summary": summary,
+                "total": total,
+                "period": f"{start_date} to {end_date}"
+            }
+
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@mcp.tool()
+async def delete_expense(expense_id: int):
+    """Delete an expense by ID.
+    
+    Args:
+        expense_id: The ID of the expense to delete
+    """
+    try:
+        await ensure_db()
+        
+        async with aiosqlite.connect(DB_PATH) as db:
+            cur = await db.execute("DELETE FROM expenses WHERE id = ?", (expense_id,))
+            await db.commit()
+            
+            if cur.rowcount == 0:
+                return {"status": "error", "message": f"Expense {expense_id} not found"}
+            
+            return {
+                "status": "success",
+                "message": f"Expense {expense_id} deleted"
+            }
 
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -133,35 +219,37 @@ async def summarize(start_date, end_date, category=None):
 # MCP RESOURCE
 # ============================================================
 
-@mcp.resource("expense:///categories", mime_type="application/json")
-def categories():
-    default = {
-        "categories": [
-            "Food & Dining",
-            "Transportation",
-            "Shopping",
-            "Entertainment",
-            "Bills & Utilities",
-            "Healthcare",
-            "Travel",
-            "Education",
-            "Business",
-            "Other"
-        ]
-    }
-
-    try:
-        if os.path.exists(CATEGORIES_PATH):
-            with open(CATEGORIES_PATH, "r", encoding="utf-8") as f:
-                return f.read()
-        return json.dumps(default, indent=2)
-
-    except Exception as e:
-        return json.dumps({"error": str(e)})
+@mcp.resource("expense:///categories")
+def get_categories() -> str:
+    """Get available expense categories."""
+    # In cloud, we can't read from filesystem, so return default
+    # In local, try to read from file, fallback to default
+    
+    if not IS_CLOUD:
+        categories_file = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), 
+            "categories.json"
+        )
+        try:
+            if os.path.exists(categories_file):
+                with open(categories_file, "r", encoding="utf-8") as f:
+                    return f.read()
+        except Exception:
+            pass
+    
+    return json.dumps(DEFAULT_CATEGORIES, indent=2)
 
 # ============================================================
 # SERVER
 # ============================================================
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="0.0.0.0", port=8000)
+    import sys
+    
+    # Determine transport based on how it's run
+    if len(sys.argv) > 1 and sys.argv[1] == "dev":
+        # fastmcp dev mode - uses stdio
+        mcp.run()
+    else:
+        # HTTP mode for cloud or direct execution
+        mcp.run(transport="http", host="0.0.0.0", port=8000)
